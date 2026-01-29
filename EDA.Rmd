@@ -1,0 +1,263 @@
+---
+title: "EDA"
+author: "Imani Jacobs"
+date: "2025-11-07"
+output: pdf_document
+editor_options: 
+  chunk_output_type: inline
+---
+
+```{r}
+library(readxl)
+library(dplyr)
+library(tidyr)
+library(ggplot2)
+library(corrplot)
+library(GGally)
+library(VIM)
+library(gridExtra)
+library(scales)
+```
+
+```{r}
+data = read_excel("community_impact.xlsx", sheet = "impact_reports")
+grants = read_excel("community_impact.xlsx", sheet = "grant_amounts")
+
+# create report-specific columns:
+data$numServed = ifelse(
+  data$reportType == "Semi-Annual", 
+  data$numServedSemi, 
+  data$numServedEOY
+)
+data$numAchieving = ifelse(
+  data$reportType == "Semi-Annual", 
+  data$numAchievingSemi, 
+  data$numAchievingEOY
+)
+```
+
+
+```{r}
+# adjust explanatory variable column to include NAs for irrelevant observations
+data$percAchievingYTD = ifelse(
+  data$numServedYTD == 0,
+  NA,
+  data$percAchievingYTD
+)
+
+# remove irrelevant columns
+data = data %>%
+  select(-numServedSemi, -numServedEOY, -numAchievingSemi, -numAchievingEOY, -percAchievingSemi, -percAchievingEOY)
+```
+
+```{r}
+# some observations are missing end-of-year data
+missingEOY = data %>%
+  group_by(agency, indicatorMeasure, year) %>%
+  summarise(
+    hasSemi = any(reportType == "Semi-Annual"),
+    hasEOY = any(reportType == "End-of-Year"),
+    .groups = "drop"
+  ) %>%
+  filter(hasSemi & !hasEOY)
+
+# one observation for every year-agency-indicator combination
+# defaults to semi-annual YTD data if there is no end-of-year
+dataAnnual = data %>%
+  group_by(agency, indicatorMeasure, year) %>%
+  filter(
+    reportType == "End-of-Year" |
+      (reportType == "Semi-Annual" &
+         !any(reportType == "End-of-Year"))
+  ) %>%
+  ungroup()
+```
+
+
+
+```{r}
+# merge grants with data table
+grantsT = grants %>%
+  pivot_longer(
+    cols = 2:6,
+    names_to = "year",
+    values_to = "grantAmount"
+  )
+dataAnnual$year = as.character(dataAnnual$year)
+dataAnnual = dataAnnual %>%
+  left_join(grantsT, by = c("year", "agency"))
+```
+
+
+```{r}
+# FIGURE 2
+ggplot(dataAnnual, aes(x = numServedYTD, y = grantAmount)) +
+  geom_point() +
+  scale_x_continuous(
+    trans = "log1p",
+    breaks = c(0, 10, 100, 1000, 10000, 100000),
+    labels = function(x) format(x, scientific = F)) +
+  theme_minimal() +
+  labs(
+    x = "Annnual Number Served (log scale)",
+    y = "Grant Amount ($)",
+    title = "Annual Number Served vs. Grant Amount") +
+  theme(
+    text = element_text(size = 14)
+  )
+```
+
+```{r}
+# FIGURE 3
+ggplot(dataAnnual, aes(x = numServedYTD, y = percAchievingYTD)) +
+  geom_point() +
+  scale_x_continuous(
+    trans = "log1p",
+    breaks = c(0, 10, 100, 1000, 10000, 100000),
+    labels = function(x) format(x, scientific = F)
+  ) +
+  theme_minimal() +
+  labs(
+    x = "Number Served (log scale)",
+    y = "Percent Achieving (logit scale)",
+    title = "Percent Achieving vs. Number Served") +
+  theme(
+    text = element_text(size = 14)
+  )
+cor(dataAnnual$numServedYTD, dataAnnual$percAchievingYTD, method = "spearman", use = "pairwise.complete.obs")
+
+# FIGURE 4
+ggplot(dataAnnual, aes(x = grantAmount, y = numAchievingYTD)) +
+  geom_point() +
+  scale_y_continuous(
+    trans = "log1p",
+    breaks = c(0, 10, 100, 1000, 10000, 100000),
+    labels = function(x) format(x, scientific = F)
+  ) +
+  theme_minimal() +
+  labs(
+    x = "Grant Amount ($)",
+    y = "Annual Number Achieving",
+    title = "Grant Amount vs. Annual Number Achieving"
+  ) +
+  theme(
+    text = element_text(size = 14)
+  )
+cor(dataAnnual$grantAmount, dataAnnual$percAchievingYTD, method = "spearman", use = "pairwise.complete.obs")
+```
+```{r}
+# distribution of percAchieving by indicator categories and measures
+# FIGURE 5
+ggplot(dataAnnual, aes(x = indicatorCategory, y = percAchievingYTD)) +
+  geom_violin() +
+  geom_jitter(width = 0.1) +
+  theme_minimal() +
+  labs(
+    x = "Indicator Category",
+    y = "Percent Achieving (%)",
+    title = "Percent Achieving by Indicator Category"
+  ) + 
+  theme(
+    text = element_text(size = 14)
+  )
+
+# FiGURE 6
+ggplot(dataAnnual, aes(x = indicatorCategory, y = grantAmount)) +
+  geom_violin() +
+  geom_jitter(width = 0.1) +
+  theme_minimal() +
+  labs(
+    x = "Indicator Category",
+    y = "Grant Amount ($)",
+    title = "Grant Amount by Indicator Category"
+  ) + 
+  theme(
+    text = element_text(size = 14)
+  )
+
+# FIGURE 7
+# order by category and then indicator
+medianOrder = dataAnnual %>%
+  group_by(indicatorCategory, indicatorMeasure) %>%
+  summarize(med = median(percAchievingYTD, na.rm = T), .groups = "drop") %>%
+  arrange(indicatorCategory, med)
+dataAnnual = dataAnnual %>%
+  mutate(
+    indicatorCategory = factor(indicatorCategory, 
+                               levels = c("Basic Needs", "Early Childhood Success", "Workforce Development")), indicatorMeasure = factor(indicatorMeasure, levels = medianOrder$indicatorMeasure)
+    )
+
+ggplot(dataAnnual, aes(x = indicatorMeasure, y = percAchievingYTD, fill = indicatorCategory)) +
+  geom_boxplot() +
+  theme_minimal() +
+  labs(
+    x = "Indicator Measure",
+    y = "Percent Achieving (%)",
+    title = "Percent Achieving by Indicator Measure"
+  ) +
+  scale_fill_discrete(name = "Indicator Category") +
+  guides(fill = guide_legend(reverse = T)) +
+  theme(
+    text = element_text(size = 20)
+  ) +
+  coord_flip()
+```
+
+```{r}
+# FIGURE 8
+dataTime = data %>%
+  mutate(
+    timeLabel = factor(
+      paste(year, ifelse(reportType == "Semi-Annual", "SA", "EOY")),
+      levels = unlist(
+        lapply(sort(unique(year)), function(y) {
+          paste(y, c("SA", "EOY"))
+        })
+      )
+    )
+  ) %>%
+  group_by(indicatorCategory, timeLabel) %>%
+  summarize(meanPerc = mean(percAchievingYTD, na.rm = TRUE), .groups = "drop")
+ggplot(dataTime, aes(x = timeLabel, y = meanPerc, color = indicatorCategory, group = indicatorCategory)) +
+  geom_line(size = 1.5) +
+  geom_point() +
+  scale_y_continuous(limits = c(0, 100)) +
+  labs(
+    x = "Reporting Period",
+    y = "Mean Percent Achieving (%)",
+    color = "Indicator Category",
+    title = "Mean Percent Achieving Over Time by Indicator Category"
+  ) +
+  theme_minimal() +
+  theme(
+    text = element_text(size = 14),
+    axis.text.x = element_text(angle = 45, hjust = 1)
+  )
+```
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
