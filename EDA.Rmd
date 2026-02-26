@@ -1,0 +1,164 @@
+---
+title: "EDA"
+author: "Imani Jacobs"
+date: "2025-11-07"
+output: pdf_document
+editor_options: 
+  chunk_output_type: inline
+---
+
+```{r}
+library(readxl)
+library(dplyr)
+library(tidyr)
+library(ggplot2)
+library(corrplot)
+library(GGally)
+library(VIM)
+library(gridExtra)
+library(knitr)
+library(scales)
+library(patchwork)
+library(naniar)
+```
+
+```{r}
+data = read_excel("community_impact.xlsx", sheet = "impact_reports")
+grants = read_excel("community_impact.xlsx", sheet = "grant_amounts")
+
+# create report-specific columns:
+data$numServed = ifelse(
+  data$reportType == "Semi-Annual", 
+  data$numServedSemi, 
+  data$numServedEOY
+)
+data$numAchieving = ifelse(
+  data$reportType == "Semi-Annual", 
+  data$numAchievingSemi, 
+  data$numAchievingEOY
+)
+# adjust explanatory variable column to include NAs for irrelevant observations
+data$percAchievingYTD = ifelse(
+  data$numServedYTD == 0,
+  NA,
+  data$percAchievingYTD
+)
+# some 0s are actually missing values
+data[data$numServed == 0, c("numServed", "numAchieving")] = NA
+
+# remove irrelevant columns
+data = data %>%
+  select(-numServedSemi, -numServedEOY, -numAchievingSemi, -numAchievingEOY, -percAchievingSemi, -percAchievingEOY,
+         -numServedProj, -numAchievingProj, -percAchievingProj)
+
+# merge grants with data table
+grantsT = grants %>%
+  pivot_longer(
+    cols = 2:6,
+    names_to = "year",
+    values_to = "grantAmount"
+  )
+data$year = as.character(data$year)
+data = data %>%
+  left_join(grantsT, by = c("year", "agency"))
+```
+
+
+```{r}
+# one observation for every year-agency-indicator combination
+# defaults to semi-annual YTD data if there is no end-of-year
+dataAnnual = data %>%
+  group_by(agency, indicatorMeasure, year) %>%
+  filter(
+    reportType == "End-of-Year" |
+      (reportType == "Semi-Annual" &
+         !any(reportType == "End-of-Year"))
+  ) %>%
+  ungroup()
+
+# assume annual funding is evenly split among served indicators
+dataAnnual = dataAnnual %>%
+  group_by(agency, year) %>%
+  mutate(
+    nMeasures = n_distinct(indicatorMeasure),
+    grantAllocated = grantAmount / nMeasures,
+    ) %>%
+  ungroup() %>%
+  select(-nMeasures)
+```
+
+```{r}
+# FIGURE 2
+dataAnnual %>%
+  miss_var_summary() %>%
+  rename(
+    Variable = variable,
+    `# Missing` = n_miss,
+    `% Missing` = pct_miss
+  )
+range(dataAnnual$grantAllocated)
+range(dataAnnual$grantAmount)
+```
+
+```{r}
+# FIGURE 3
+ggplot(dataAnnual, aes(x = indicatorCategory, y = percAchievingYTD)) +
+  geom_violin(draw_quantiles = c(0.25, 0.5, 0.75)) +
+  geom_jitter(width = 0.1) +
+  theme_minimal() +
+  labs(
+    x = "Indicator Category",
+    y = "Percent Achieving (%)",
+    title = "Percent Achieving by Indicator Category"
+  ) + 
+  theme(
+    text = element_text(size = 14)
+  )
+```
+```{r}
+# FIGURE 4
+ggplot(dataAnnual, aes(x = indicatorCategory, y = grantAllocated)) +
+  geom_violin(draw_quantiles = c(0.25, 0.5, 0.75)) +
+  geom_jitter(width = 0.1) +
+  theme_minimal() +
+  labs(
+    x = "Indicator Category",
+    y = "Grant Amount ($)",
+    title = "Grant Amount by Indicator Category"
+  ) + 
+  theme(
+    text = element_text(size = 14)
+  )
+```
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
