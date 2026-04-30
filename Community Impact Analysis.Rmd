@@ -1,0 +1,483 @@
+---
+title: "Community Impact Analysis"
+author: "Imani Jacobs"
+date: "2025-11-07"
+output: pdf_document
+editor_options: 
+  chunk_output_type: console
+---
+
+```{r Import Libraries, message = F, warning = F}
+library(readxl)
+library(dplyr)
+library(tidyr)
+library(ggplot2)
+library(knitr)
+library(scales)
+library(naniar)
+library(glmmTMB)
+library(DHARMa)
+library(emmeans)
+library(ggeffects)
+library(parameters)
+library(tibble)
+```
+
+```{r Read Data}
+data = read_excel("community_impact.xlsx", sheet = "impact_reports")
+grants = read_excel("community_impact.xlsx", sheet = "grant_amounts")
+```
+
+```{r Merge Columns}
+# create report-specific columns:
+data = data %>%
+  mutate(
+    numServed = ifelse(reportType == "Semi-Annual", numServedSemi, numServedEOY),
+    numAchieving = ifelse(reportType == "Semi-Annual", numAchievingSemi, numAchievingEOY),
+  )
+```
+
+```{r Fix Values}
+# combine measures that were intended to measure the same thing
+data$indicatorMeasure[grep("skipping", data$indicatorMeasure)] = "% of target group skipping less than 2 meals a week" 
+
+data = data %>%
+  # if end-of-year observation has numServedYTD as 0, wipe group
+  group_by(agency, year, indicatorMeasure) %>%
+  mutate(
+    zero_served_YTD = any(numServedYTD == 0 & reportType == "End-of-Year"),
+    numServedYTD = ifelse(zero_served_YTD, NA, numServedYTD),
+    numAchievingYTD = ifelse(zero_served_YTD, NA, numAchievingYTD),
+    numServed = ifelse(zero_served_YTD, NA, numServed),
+    numAchieving = ifelse(zero_served_YTD, NA, numAchieving) 
+  )  %>%
+  ungroup() %>%
+  select(-zero_served_YTD) %>%
+  # if numServedYTD is 0, percent achieving success is NA
+  mutate(
+    percAchievingYTD = ifelse(numServedYTD == 0, NA, percAchievingYTD),
+  ) 
+```
+
+```{r Merge Sheets}
+# merge grants with data table
+grantsT = grants %>%
+  pivot_longer(
+    cols = 2:6,
+    names_to = "year",
+    values_to = "grantAmount"
+  )
+data$year = as.character(data$year)
+data = data %>%
+  left_join(grantsT, by = c("year", "agency"))
+```
+
+```{r Create Funding Variable}
+# assume annual funding is evenly split among served measures
+data = data %>%
+  group_by(agency, year) %>%
+  mutate(
+    nMeasures = n_distinct(indicatorMeasure),
+    grantAllocated = grantAmount / nMeasures,
+    ) %>%
+  ungroup() %>%
+  select(-nMeasures)
+```
+
+
+```{r Select Columns}
+# remove irrelevant columns
+data = data %>%
+  select(-numServedSemi, -numServedEOY, -numAchievingSemi, -numAchievingEOY, -percAchievingSemi, -percAchievingEOY, -numServedProj, -numAchievingProj, -percAchievingProj, -numServed, -numAchieving)
+```
+
+```{r Filter Data}
+# one observation for every year-agency-measure combination
+# defaults to semi-annual YTD data if there is no end-of-year
+dataAnnual = data %>%
+  group_by(agency, indicatorMeasure, year) %>%
+  filter(
+    reportType == "End-of-Year" |
+      (reportType == "Semi-Annual" &
+         !any(reportType == "End-of-Year"))
+  ) %>%
+  ungroup()
+```
+
+```{r Table 2 - Summarize Missingness}
+# TABLE 2
+missing = dataAnnual %>%
+  miss_var_summary() %>%
+  rename(
+    Variable = variable,
+    `# Missing` = n_miss,
+    `% Missing` = pct_miss
+  ) %>%
+  filter(`# Missing` > 0)
+kable(missing)
+```
+```{r Remove Missing Observations}
+dataAnnual = dataAnnual %>%
+  drop_na(percAchievingYTD)
+```
+
+```{r Figure 1 - Distribution of Success by Category}
+# FIGURE 1
+ggplot(dataAnnual, aes(x = indicatorCategory, y = percAchievingYTD, fill = indicatorCategory)) +
+  geom_boxplot() +
+  scale_y_continuous(
+    limits = c(0, 100),
+    labels= function(x) paste0(x, "%")
+  ) +
+  scale_fill_manual(
+    values = c("#fd3428", "#0044b5", "#ffbb00"),
+    name = "Category"
+  ) +
+  labs(
+    x = "Category",
+    y = "Percent Achieving",
+    title = "Percent Achieving Success by Category"
+  ) + 
+  theme_minimal() +
+  theme(
+    text = element_text(size = 14)
+  )
+```
+
+```{r Figure 2 - Distribution of Total Funding by Category}
+# FIGURE 2
+fig2Data = dataAnnual %>%
+  group_by(agency, year, indicatorCategory) %>%
+  summarise(
+    categoryFunding = sum(grantAllocated, na.rm = T),
+    .groups = "drop"
+  )
+ggplot(fig2Data, aes(x = indicatorCategory, y = categoryFunding, fill = indicatorCategory)) +
+  geom_boxplot() +
+  scale_y_continuous(
+    labels = scales::dollar
+  ) +
+  scale_fill_manual(
+    values = c("#fd3428", "#0044b5", "#ffbb00"),
+    name = "Category"
+  ) +
+  labs(
+    x = "Category",
+    y = "Grant Amount",
+    title = "Total Grant Amount by Category"
+  ) + 
+  theme_minimal() +
+  theme(
+    text = element_text(size = 14)
+  )
+```
+
+```{r Table 3 - Measures Served per Category}
+# TABLE 3
+# average number of measures served per category
+table3Data = dataAnnual %>%
+  distinct(year, agency, indicatorCategory, indicatorMeasure) %>%
+  group_by(year, indicatorCategory, agency) %>%
+  summarise(
+    nMeasures = n(),
+    .groups = "drop"
+  )
+categoryOverall = table3Data %>%
+  group_by(indicatorCategory) %>%
+  summarise(
+    avgMeasures = mean(nMeasures),
+    minMeasures = min(nMeasures),
+    maxMeasures = max(nMeasures),
+    .groups = "drop"
+  )
+kable(categoryOverall,
+      digits = 2,
+      col.names = c(
+        "Category",
+        "Average # of Measures",
+        "Min",
+        "Max"
+      )
+)
+```
+
+```{r Figure 3 - Distribution of Funding per Measure by Category}
+# FIGURE 3
+ggplot(dataAnnual, aes(x = indicatorCategory, y = grantAllocated, fill = indicatorCategory)) +
+  geom_boxplot() +
+  scale_y_continuous(
+    labels = scales::dollar
+  ) +
+  scale_fill_manual(
+    values = c("#fd3428", "#0044b5", "#ffbb00"),
+    name = "Category"
+  ) +
+  labs(
+    x = "Category",
+    y = "Grant Allocated",
+    title = "Grant Allocated per Measure by Category"
+  ) + 
+  theme_minimal() +
+  theme(
+    text = element_text(size = 14)
+  )
+```
+
+```{r Figure 4 - Distribution of Success by Measure}
+# FIGURE 4
+medianOrder = dataAnnual %>%
+  group_by(indicatorCategory, indicatorMeasure) %>%
+  summarize(med = median(percAchievingYTD, na.rm = T), .groups = "drop") %>%
+  arrange(indicatorCategory, med)
+dataAnnual = dataAnnual %>%
+  mutate(
+    indicatorCategory = factor(indicatorCategory, 
+                               levels = c("Basic Needs", "Early Childhood Success", "Workforce Development")), indicatorMeasure = factor(indicatorMeasure, levels = medianOrder$indicatorMeasure)
+    )
+
+ggplot(dataAnnual, aes(x = indicatorMeasure, y = percAchievingYTD, fill = indicatorCategory)) +
+  geom_boxplot() +
+  scale_y_continuous(
+    limits = c(0, 100),
+    labels= function(x) paste0(x, "%")
+  ) +
+  labs(
+    x = "Measure",
+    y = "Percent Achieving",
+    title = "Percent Achieving by Measure"
+  ) +
+  scale_fill_manual(
+    values = c("#fd3428", "#0044b5", "#ffbb00"),
+    name = "Category"
+  ) +
+  guides(fill = guide_legend(reverse = F)) +
+  theme_minimal() +
+  theme(
+    text = element_text(size = 20)
+  ) +
+  coord_flip()
+```
+
+```{r Figure 5 - Success by Number Served}
+# FIGURE 5
+ggplot(dataAnnual, aes(x = log1p(numServedYTD), y = percAchievingYTD)) +
+  geom_point(alpha = 0.6) +
+  scale_y_continuous(
+    limits = c(0, 100),
+    labels= function(x) paste0(x, "%")
+  ) +
+  labs(
+    x = "Log(1 + Number Served YTD)",
+    y = "Percent Achieving",
+    title = "Percent Achieving by Annual Number Served"
+  ) +
+  theme_minimal() +
+  theme(
+    text = element_text(size = 14)
+  )
+```
+
+# Modeling
+
+```{r Define Variables as Factors}
+dataAnnual$yearFac = 
+  as.factor(dataAnnual$year)
+dataAnnual$indicatorFac =
+  as.factor(dataAnnual$indicatorMeasure)
+dataAnnual$agencyFac = 
+  as.factor(dataAnnual$agency)
+dataAnnual$categoryFac = 
+  as.factor(dataAnnual$indicatorCategory)
+dataAnnual$obsID = 1:nrow(dataAnnual)
+```
+
+```{r GLM Model}
+# helper function to log-transform and center continuous variables to avoid collinearity
+center_log = function(x) {
+  log(x) - mean(log(x), na.rm = T)
+}
+
+GLMmodel = glmmTMB(
+  # success = numAchievingYTD
+  # failure = numServedYTD - numAchievingYTD
+  cbind(numAchievingYTD, numServedYTD - numAchievingYTD) ~ 
+    yearFac*categoryFac +
+    I(center_log(grantAllocated))*categoryFac +
+    I(center_log(numServedYTD))*I(center_log(grantAllocated)) +
+    (1 | agencyFac) +
+    (1 | indicatorFac) +
+    (1 | obsID)
+  ,
+  family = binomial(link = "logit"),
+  data = dataAnnual
+)
+```
+
+```{r Table 4 - Random Effects Summary}
+# TABLE 4
+table4Data = model_parameters(GLMmodel, effects = "random") %>%
+  select(Parameter, Coefficient) %>%
+  mutate(
+    Variance = Coefficient^2,
+    Effect = case_when(
+      row_number() == 1 ~ "Agency (Intercept)",
+      row_number() == 2 ~ "Measure (Intercept)",
+      row_number() == 3 ~ "Observation (Intercept)"
+    )
+  ) %>%
+  rename(`Std. Dev.` = Coefficient) %>%
+  select(Effect, Variance, `Std. Dev.`)
+kable(table4Data,
+      digits = 3,
+      align = "lrr")
+```
+
+```{r Table 5 - ANOVA}
+# TABLE 5
+table5Data = glmmTMB:::Anova.glmmTMB(GLMmodel) %>%
+  as.data.frame() %>%
+  rownames_to_column("Term") %>%
+  mutate(
+    Term = recode(Term,
+                  "yearFac" = "Year",
+                  "categoryFac" = "Category",
+                  "I(center_log(grantAllocated))" = "Log(Funding)",
+                  "I(center_log(numServedYTD))" = "Log(Number Served)",
+                  "yearFac:categoryFac" = "Year × Category",
+                  "categoryFac:I(center_log(grantAllocated))" = "Category × Funding",
+                  "I(center_log(grantAllocated)):I(center_log(numServedYTD))" = "Funding × Number Served"),
+    `Pr(>Chisq)` = ifelse(`Pr(>Chisq)` < 0.001, "<0.001", round(`Pr(>Chisq)`, 3)),
+    Df = as.integer(Df)
+  ) %>%
+  rename(
+    Term = Term,
+    "Chi-sq" = Chisq,
+    "df" = Df,
+    "p-value" = `Pr(>Chisq)`
+  )
+kable(table5Data,
+      col.names = c("Term", "Chi-sq", "df", "p-value"),
+      digits = 3,
+      align = c("lrrr"),
+)
+```
+
+```{r Table 6 - Pairwise Comparisons}
+# TABLE 6
+table6Data = emmeans(GLMmodel, pairwise ~ categoryFac, type = "response")$contrasts %>%
+  as.data.frame() %>%
+  select(contrast, odds.ratio, SE, p.value) %>%
+  mutate(
+    p.value = ifelse(p.value < 0.001, "<0.001", p.value)
+  )
+
+kable(table6Data,
+      col.names = c("Comparison Pair", "Odds Ratio", "Std. Error", "p-value"),
+      digits = 3,
+      align = "lrrr"
+)
+```
+
+```{r Figure 6 - Success Over Time}
+# FIGURE 6
+fig6Data = emmip(GLMmodel, categoryFac ~ yearFac, type = "response", plotit = F)
+ggplot(fig6Data, aes(x = yearFac, y = yvar, color = categoryFac, group = categoryFac)) +
+  geom_line(linewidth = 1) +
+  geom_point(size = 1.5) +
+  scale_y_continuous(
+    labels = scales::percent,
+    limits = c(0, 1)
+  ) +
+  scale_color_manual(values = c("#fd3428", "#0044b5", "#ffbb00")) +
+  labs(
+    x = "Year",
+    y = "Predicted Probability of Success",
+    title = "Predicted Probability of Success Over Time by Category",
+    color = "Category"
+  ) +
+  theme_minimal() +
+  theme(
+    text = element_text(size = 14)
+  )
+```
+
+```{r Figure 7 - Success by Funding and Category}
+# FIGURE 7
+fig7Data = ggeffect(
+  GLMmodel,
+  terms = c("grantAllocated", "categoryFac")
+)
+ggplot(fig7Data, aes(x = x, y = predicted, color = group, fill = group)) +
+  geom_line(linewidth = 1) +
+  geom_ribbon(
+   aes(ymin = conf.low, ymax = conf.high),
+   alpha = 0.2,
+   color = NA
+  ) +
+  facet_wrap(~ group) +
+  scale_x_continuous(
+    breaks = seq(0, 100000, by = 25000),
+    labels = function(x) paste0("$", x / 1000, "k")
+  ) +
+  scale_y_continuous(
+    labels = scales::percent,
+    limits = c(0, 1)
+  ) +
+  scale_color_manual(values = c("#fd3428", "#0044b5", "#ffbb00")) +
+  scale_fill_manual(values = c("#fd3428", "#0044b5", "#ffbb00")) +
+  guides(fill = "none") +
+  labs(
+    x = "Grant Allocated per Measure",
+    y = "Predicted Probability of Success",
+    color = "Number Served",
+    title = "Predicted Probability of Success by Funding per Measure and Category"
+  ) +
+  theme_minimal() +
+  theme(
+    text = element_text(size = 14),
+    axis.text.x = element_text(angle = 30, hjust = 1),
+    panel.spacing = unit(0.5, "cm")
+  )
+```
+
+
+```{r Figure 8 - Success by Funding and Number Served}
+# FIGURE 8
+fig8Data = ggeffect(
+  GLMmodel, 
+  terms = c("grantAllocated", "numServedYTD [29, 60, 202]")
+)
+fig8Data$group = factor(
+  fig8Data$group,
+  levels = c("29", "60", "202"),
+  labels = c(
+    "Low (29 Served)",
+    "Medium (60 Served)",
+    "High (202 Served)"
+  )
+)
+ggplot(fig8Data, aes(x = x, y = predicted, color = group)) +
+  geom_line(linewidth = 1) +
+  scale_x_continuous(labels = scales::dollar) +
+  scale_y_continuous(labels = scales::percent) +
+  scale_color_manual(values = c("#fd3428", "#0044b5", "#ffbb00")) +
+  labs(
+    x = "Grant Allocated per Measure",
+    y = "Probability of Success",
+    color = "Number Served",
+    title = "Predicted Probability of Success by Funding per Measure and Number Served"
+  ) +
+  theme_minimal() +
+  theme(
+    text = element_text(size = 14)
+  )
+```
+
+```{r Model Evaluation}
+simRes = DHARMa::simulateResiduals(GLMmodel)
+plot(simRes)
+```
+
+
+
+
